@@ -1,0 +1,3 @@
+# AlphaWheel app config (separate from Streamlit's .streamlit/config.toml)
+[screener]
+source = "yfinance"
