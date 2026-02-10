@@ -10,6 +10,8 @@ import json
 from urllib.request import urlopen
 import certifi
 import os
+import math
+from schwab_login import get_schwab_client
 
 # ========== 1. INITIAL SETUP & CONFIG ==========
 st.set_page_config(
@@ -119,27 +121,133 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ========== 5. HELPER FUNCTIONS ==========
+def norm_cdf(x):
+    """Cumulative distribution function for the standard normal distribution"""
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+def calculate_prob_otm(current_price, strike_price, iv, dte, r=0.05, option_type="put"):
+    """Calculate Probability OTM using Black-Scholes d2."""
+    if current_price <= 0 or strike_price <= 0 or iv <= 0 or dte <= 0:
+        return 0.0
+    
+    t = dte / 365.0
+    numerator = math.log(current_price / strike_price) + (r - 0.5 * iv**2) * t
+    denominator = iv * math.sqrt(t)
+    d2 = numerator / denominator
+    
+    if option_type == "call":
+        # Probability that S_T < K
+        return norm_cdf(-d2)
+    # put: Probability that S_T > K
+    return norm_cdf(d2)
+
+def calculate_rsi(data, window=14):
+    """Calculate RSI from price series using Wilder's smoothing"""
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/window, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/window, adjust=False).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
 def fetch_stock_data(symbols):
-    """Fetch real stock data from Yahoo Finance"""
+    """Fetch real stock data and RSI from Yahoo Finance"""
     try:
         symbols_clean = [s.replace('.', '-') for s in symbols if s]
         if not symbols_clean:
             return {}
         
         tickers = yf.Tickers(" ".join(symbols_clean))
-        data = tickers.history(period="1d", interval="1d")
+        # Fetch 3 months to ensure enough data for RSI
+        data = tickers.history(period="3mo", interval="1d")
         
         if not data.empty and 'Close' in data.columns:
+            # Calculate RSI
+            rsi_data = calculate_rsi(data['Close'])
+            
+            # Calculate Volatility (Annualized std dev of log returns)
+            log_returns = np.log(data['Close'] / data['Close'].shift(1))
+            volatility = log_returns.std() * (252 ** 0.5)
+            
             prices = data['Close'].iloc[-1]
-            price_dict = {}
-            for yahoo_symbol, price in prices.items():
-                if isinstance(yahoo_symbol, str):
-                    original_symbol = yahoo_symbol.replace('-', '.')
-                    price_dict[original_symbol] = float(price)
-            return price_dict
+            volumes = data['Volume'].iloc[-1] if 'Volume' in data.columns else None
+            current_rsi = rsi_data.iloc[-1]
+            
+            result_dict = {}
+            
+            # Handle single vs multiple tickers
+            if isinstance(prices, pd.Series):
+                for yahoo_symbol, price in prices.items():
+                    if isinstance(yahoo_symbol, str):
+                        original_symbol = yahoo_symbol.replace('-', '.')
+                        rsi_val = current_rsi[yahoo_symbol] if yahoo_symbol in current_rsi else 50.0
+                        iv_val = volatility[yahoo_symbol] if isinstance(volatility, pd.Series) and yahoo_symbol in volatility else 0.3
+                        vol_val = volumes[yahoo_symbol] if isinstance(volumes, pd.Series) and yahoo_symbol in volumes else None
+                        result_dict[original_symbol] = {
+                            'price': float(price),
+                            'rsi': float(rsi_val),
+                            'iv': float(iv_val),
+                            'volume': int(vol_val) if vol_val is not None and not pd.isna(vol_val) else None
+                        }
+            else:
+                # Single ticker case
+                if symbols_clean:
+                    sym = symbols_clean[0].replace('-', '.')
+                    iv_val = float(volatility) if not isinstance(volatility, pd.Series) else float(volatility.iloc[0])
+                    vol_val = None
+                    if isinstance(volumes, pd.Series) and not volumes.empty:
+                        vol_val = volumes.iloc[0]
+                    elif volumes is not None:
+                        vol_val = volumes
+                    result_dict[sym] = {
+                        'price': float(prices),
+                        'rsi': float(current_rsi),
+                        'iv': iv_val,
+                        'volume': int(vol_val) if vol_val is not None and not pd.isna(vol_val) else None
+                    }
+                    
+            return result_dict
     except Exception as e:
         st.error(f"Data fetch error: {str(e)[:100]}")
     return {}
+
+@st.cache_data(ttl=3600)
+def fetch_option_snapshot(symbol, target_dte=30):
+    """Fetch option data (put) from Yahoo Finance near target DTE and strike."""
+    try:
+        yf_symbol = symbol.replace('.', '-')
+        ticker = yf.Ticker(yf_symbol)
+        expirations = ticker.options
+        if not expirations:
+            return None
+        
+        today = datetime.now().date()
+        exp_dates = []
+        for exp in expirations:
+            try:
+                exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+                dte = (exp_date - today).days
+                exp_dates.append((exp, dte))
+            except Exception:
+                continue
+        
+        if not exp_dates:
+            return None
+        
+        exp_dates.sort(key=lambda x: (x[1] < 0, abs(x[1] - target_dte)))
+        chosen_exp, chosen_dte = exp_dates[0]
+        
+        chain = ticker.option_chain(chosen_exp)
+        puts = chain.puts
+        if puts is None or puts.empty:
+            return None
+        
+        return {
+            'expiration': chosen_exp,
+            'dte': max(chosen_dte, 0),
+            'puts': puts
+        }
+    except Exception:
+        return None
 
 def calculate_premium(current_price, strike_price, iv=0.3, dte=30, r=0.05):
     """Calculate estimated option premium using simplified Black-Scholes"""
@@ -183,7 +291,7 @@ def get_company_name(symbol):
     }
     return company_names.get(symbol, symbol)
 
-def get_sp500_symbols():
+def get_sp500_symbols(return_dict=False):
     """Get S&P 500 symbols with fallback"""
     try:
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
@@ -196,11 +304,19 @@ def get_sp500_symbols():
         if response.status_code == 200:
             tables = pd.read_html(response.text)
             table = tables[0]
-            return table['Symbol'].tolist()
+            if return_dict:
+                return {str(s).strip(): str(n).strip() for s, n in zip(table['Symbol'], table['Security'])}
+            return [str(s).strip() for s in table['Symbol'].tolist()]
         else:
+            if return_dict:
+                fallback = get_sp500_fallback_list()
+                return {s: get_company_name(s) for s in fallback}
             return get_sp500_fallback_list()
             
     except Exception as e:
+        if return_dict:
+            fallback = get_sp500_fallback_list()
+            return {s: get_company_name(s) for s in fallback}
         return get_sp500_fallback_list()
 
 def get_sp500_fallback_list():
@@ -305,12 +421,15 @@ def screen_with_yfinance(price_range, **kwargs):
     
     # Filter by price range
     screened_stocks = []
-    for symbol, price in all_prices.items():
+    for symbol, data in all_prices.items():
+        price = data['price']
+        rsi = data['rsi']
         if price_range[0] <= price <= price_range[1]:
             screened_stocks.append({
                 'symbol': symbol,
                 'companyName': get_company_name(symbol),
                 'price': price,
+                'rsi': rsi,
                 'marketCap': 'N/A',
                 'sector': 'N/A',
                 'industry': 'N/A',
@@ -352,7 +471,7 @@ def get_screened_stocks(price_range, **additional_filters):
 
 # ========== 7. CSP CANDIDATE FUNCTIONS ==========
 def process_stock_candidate(symbol, current_price, company_name, price_range, discount_value, 
-                           discount_mode, prob_ownership, min_premium, dte, candidates_list):
+                           discount_mode, prob_ownership, min_premium, dte, candidates_list, rsi=None):
     """Process a single stock candidate"""
     if price_range[0] <= current_price <= price_range[1]:
         # Calculate INDIVIDUAL strike price
@@ -386,6 +505,7 @@ def process_stock_candidate(symbol, current_price, company_name, price_range, di
             'Symbol': symbol,
             'Company': company_name,
             'Current': round(current_price, 2),
+            'RSI': round(rsi, 1) if rsi is not None else 'N/A',
             'Strike': round(strike_price, 2),
             'Discount $': round(discount_amount, 2),
             'Discount %': round(discount_pct, 2),
@@ -417,9 +537,10 @@ def create_csp_candidates(price_range, discount_value, discount_mode, prob_owner
         symbol = row['symbol']
         current_price = row['price']
         company_name = row['companyName']
+        rsi = row.get('rsi', 50)
         
         process_stock_candidate(symbol, current_price, company_name, price_range, discount_value, 
-                              discount_mode, prob_ownership, min_premium, dte, candidates)
+                              discount_mode, prob_ownership, min_premium, dte, candidates, rsi)
     
     if candidates:
         df = pd.DataFrame(candidates)
@@ -448,15 +569,26 @@ with st.sidebar:
     # Brokerage Connection
     st.subheader("🌐 Brokerage Connection")
     if not st.session_state.authenticated:
-        broker = st.selectbox("Select Broker", ["Demo", "Charles Schwab", "E*Trade", "Fidelity", "Merrill"])
+        broker = st.selectbox("Select Broker", ["None", "Charles Schwab", "E*Trade", "Fidelity", "Merrill"])
         if st.button("🔗 Connect", use_container_width=True, type="primary"):
             with st.spinner("Connecting..."):
-                time.sleep(0.5)
-                st.session_state.authenticated = True
-                st.session_state.broker = broker
-                st.rerun()
+                if broker == "None":
+                    st.warning("Please select a brokerage to connect.")
+                elif broker == "Charles Schwab":
+                    client = get_schwab_client()
+                    if client:
+                        st.session_state.authenticated = True
+                        st.session_state.broker = broker
+                        st.rerun()
+                    else:
+                        st.error("Authentication failed. Did you cancel the login or deny access?")
+                else:
+                    time.sleep(0.5)
+                    st.session_state.authenticated = True
+                    st.session_state.broker = broker
+                    st.rerun()
     else:
-        st.success(f"✅ {st.session_state.get('broker', 'Demo')}")
+        st.success(f"✅ {st.session_state.get('broker', 'None')}")
         if st.button("Disconnect", use_container_width=True):
             st.session_state.authenticated = False
             st.rerun()
@@ -656,7 +788,7 @@ if menu_selection == "Stock Hunter (CSP)":
         """, unsafe_allow_html=True)
         
         # Select columns to display
-        display_columns = ['Symbol', 'Company', 'Current', 'Strike', 'Discount $', 'Discount %', 
+        display_columns = ['Symbol', 'Company', 'Current', 'RSI', 'Strike', 'Discount $', 'Discount %', 
                           'Premium', 'Annual Return %', 'Prob.', 'Cushion %']
         
         available_columns = [col for col in display_columns if col in df_display.columns]
@@ -714,51 +846,184 @@ elif menu_selection == "Watchlist Manager":
     st.title("👀 Watchlist Manager")
     st.caption(f"Date: {datetime.now().strftime('%B %d, %Y')}")
     
-    # Add Symbols
-    col1, col2 = st.columns([3, 1])
+    # Add Symbols + Free Cash
+    col1, col2, col3 = st.columns([3, 2, 2])
     with col1:
         st.subheader("Your Watchlist")
     with col2:
-        new_symbol = st.text_input("Add Symbol", placeholder="AAPL", key="new_symbol")
-        if st.button("Add", key="add_symbol") and new_symbol:
-            symbol_clean = new_symbol.upper().strip()
-            if symbol_clean and symbol_clean not in st.session_state.watchlist:
-                st.session_state.watchlist.append(symbol_clean)
-                st.rerun()
+        # Autocomplete using S&P 500 list
+        sp500_dict = get_sp500_symbols(return_dict=True)
+        extra_tickers = {"F": "Ford Motor"}
+        
+        def add_symbol_from_selectbox():
+            symbol = st.session_state.get("new_symbol", "").upper().strip()
+            if symbol:
+                if symbol not in st.session_state.watchlist:
+                    st.session_state.watchlist.append(symbol)
+                st.session_state.new_symbol = ""
+        
+        if sp500_dict:
+            sp500_dict.update({k: v for k, v in extra_tickers.items() if k not in sp500_dict})
+            options = [""] + sorted(sp500_dict.keys(), key=lambda s: (len(s), s))
+            new_symbol = st.selectbox(
+                "Add Symbol",
+                options=options,
+                format_func=lambda x: f"{x} - {sp500_dict[x]}" if x else "",
+                key="new_symbol",
+                on_change=add_symbol_from_selectbox
+            )
+        else:
+            new_symbol = st.selectbox("Add Symbol", options=[""], key="new_symbol")
+    with col3:
+        max_cash = int(st.session_state.get('free_cash', 50000))
+        cash_options = list(range(5000, max(max_cash, 5000) + 1, 5000))
+        if cash_options[-1] != max_cash:
+            cash_options.append(max_cash)
+        
+        default_cash = st.session_state.get('free_cash_selected', cash_options[0])
+        if default_cash not in cash_options:
+            default_cash = cash_options[0]
+        
+        selected_cash = st.selectbox(
+            "Free Cash",
+            options=cash_options,
+            index=cash_options.index(default_cash),
+            help="Used to check if 1 CSP contract (100 shares) is affordable"
+        )
+        st.session_state.free_cash_selected = selected_cash
     
     # Display Watchlist
     if st.session_state.watchlist:
+        selected_cash = st.session_state.get('free_cash_selected', 5000)
+        
         price_data = fetch_stock_data(st.session_state.watchlist)
         
         watchlist_items = []
         for symbol in st.session_state.watchlist:
             if symbol in price_data:
-                price = price_data[symbol]
-                change = np.random.uniform(-2, 2)  # Simulated change
+                data = price_data[symbol]
+                price = data['price']
+                iv = data.get('iv', 0.30)
+                stock_volume = data.get('volume')
+                
+                # Option data from Yahoo Finance (closest to 30 DTE, 5% OTM put)
+                dte = 30
+                strike_price = round(price * 0.95, 1) # fallback
+                premium = calculate_premium(price, strike_price, iv, dte)
+                option_volume = None
+                
+                option_snapshot = fetch_option_snapshot(symbol, target_dte=30)
+                if option_snapshot:
+                    puts = option_snapshot['puts']
+                    try:
+                        dte = int(option_snapshot['dte'])
+                        puts = puts.copy()
+                        if 'impliedVolatility' in puts.columns:
+                            puts = puts[puts['impliedVolatility'].notna()]
+                            puts = puts[puts['impliedVolatility'] > 0]
+                        
+                        if puts.empty:
+                            raise ValueError("No valid IV in option chain")
+                        
+                        puts['prob_otm'] = puts.apply(
+                            lambda r: calculate_prob_otm(
+                                price,
+                                float(r['strike']),
+                                float(r['impliedVolatility']),
+                                dte,
+                                option_type="put"
+                            ),
+                            axis=1
+                        )
+                        
+                        # Pick strike with prob_otm >= 0.80 closest to 0.80
+                        eligible = puts[puts['prob_otm'] >= 0.80]
+                        if not eligible.empty:
+                            idx = (eligible['prob_otm'] - 0.80).abs().idxmin()
+                            row = eligible.loc[idx]
+                        else:
+                            # Fallback: highest probability OTM
+                            row = puts.loc[puts['prob_otm'].idxmax()]
+                        
+                        strike_price = float(row['strike'])
+                        
+                        iv_val = row.get('impliedVolatility')
+                        if pd.notna(iv_val) and iv_val > 0:
+                            iv = float(iv_val)
+                        
+                        bid = row.get('bid', np.nan)
+                        ask = row.get('ask', np.nan)
+                        last_price = row.get('lastPrice', np.nan)
+                        if pd.notna(bid) and pd.notna(ask) and bid > 0 and ask > 0:
+                            premium = float((bid + ask) / 2.0)
+                        elif pd.notna(last_price) and last_price > 0:
+                            premium = float(last_price)
+                        
+                        opt_vol = row.get('volume')
+                        if pd.notna(opt_vol):
+                            option_volume = int(opt_vol)
+                    except Exception:
+                        pass
+                
+                # Calculate Metrics
+                prob_otm = calculate_prob_otm(price, strike_price, iv, dte)
+                volume = option_volume if option_volume is not None else stock_volume
+                
                 watchlist_items.append({
                     'Symbol': symbol,
-                    'Price': f"${price:,.2f}",
-                    'Change': f"{change:+.2f}%",
-                    'Change $': f"${price * change/100:+.2f}"
+                    'Price': price,
+                    'Strike': strike_price,
+                    'Exp (Days)': dte,
+                    'Vol': volume if volume is not None else 0,
+                    'Prob OTM': prob_otm * 100,
+                    'Premium': premium,
+                    'Return': (premium / strike_price) * (365/dte) * 100,
+                    'Cash Req': strike_price * 100
                 })
         
         if watchlist_items:
-            for item in watchlist_items:
-                cols = st.columns([1, 2, 2, 2, 1])
-                with cols[0]:
-                    st.markdown(f"**{item['Symbol']}**")
-                with cols[1]:
-                    st.markdown(item['Price'])
-                with cols[2]:
-                    color = "positive" if '+' in item['Change'] else "negative"
-                    st.markdown(f"<span class='{color}'>{item['Change']}</span>", unsafe_allow_html=True)
-                with cols[3]:
-                    color = "positive" if '+' in item['Change $'] else "negative"
-                    st.markdown(f"<span class='{color}'>{item['Change $']}</span>", unsafe_allow_html=True)
-                with cols[4]:
-                    if st.button("❌", key=f"rm_{item['Symbol']}"):
-                        st.session_state.watchlist.remove(item['Symbol'])
-                        st.rerun()
+            df_watch = pd.DataFrame(watchlist_items)
+            
+            df_watch["Contracts"] = (selected_cash / df_watch["Cash Req"]).floordiv(1).astype(int)
+            df_watch["Total Cash"] = df_watch["Cash Req"] * df_watch["Contracts"]
+            df_watch["Total Premium"] = df_watch["Premium"] * df_watch["Contracts"] * 100
+            
+            def cash_style(row):
+                if row["Contracts"] < 1:
+                    return ["background-color: #efefef; color: #888;"] * len(row)
+                return [""] * len(row)
+            
+            styled = (
+                df_watch.style
+                .apply(cash_style, axis=1)
+                .format({
+                    "Price": "${:,.2f}",
+                    "Strike": "${:,.2f}",
+                    "Exp (Days)": "{:.0f}",
+                    "Vol": "{:,.0f}",
+                    "Prob OTM": "{:.1f}%",
+                    "Premium": "${:,.2f}",
+                    "Return": "{:.1f}%",
+                    "Cash Req": "${:,.0f}",
+                    "Contracts": "{:,.0f}",
+                    "Total Cash": "${:,.0f}",
+                    "Total Premium": "${:,.2f}"
+                })
+            )
+            
+            st.dataframe(
+                styled,
+                hide_index=True,
+                width='stretch'
+            )
+            
+            # Remove functionality
+            to_remove = st.multiselect("Select symbols to remove:", st.session_state.watchlist)
+            if st.button("Remove Selected"):
+                for s in to_remove:
+                    if s in st.session_state.watchlist:
+                        st.session_state.watchlist.remove(s)
+                st.rerun()
         else:
             st.info("No price data available")
     else:
@@ -767,38 +1032,89 @@ elif menu_selection == "Watchlist Manager":
 elif menu_selection == "Portfolio Manager":
     st.title("💰 Portfolio Manager")
     
+    # Check mode
     if not st.session_state.authenticated:
-        st.warning("Connect to brokerage first...")
-    
-    if st.session_state.portfolio:
-        symbols = list(st.session_state.portfolio.keys())
-        prices = fetch_stock_data(symbols)
+        st.warning("⚠️ Please connect to your brokerage to view positions.")
+        portfolio_source = {}
+    else:
+        # Real Portfolio (from session state or API)
+        if not st.session_state.portfolio:
+            st.info("No positions found in connected account.")
+        portfolio_source = st.session_state.portfolio
+
+    if portfolio_source:
+        # Fetch real-time data for the symbols in portfolio
+        symbols = list(portfolio_source.keys())
+        with st.spinner("Fetching market data..."):
+            market_data = fetch_stock_data(symbols)
         
-        portfolio_data = []
-        total_value = 0
+        portfolio_rows = []
+        total_equity = 0.0
+        total_cost_basis = 0.0
         
-        for symbol, details in st.session_state.portfolio.items():
-            if symbol in prices:
-                current = prices[symbol]
-                shares = details['shares']
-                cost = details['cost']
-                value = shares * current
-                pnl = (current - cost) * shares
-                pnl_pct = ((current - cost) / cost) * 100
-                
-                total_value += value
-                portfolio_data.append({
-                    'Symbol': symbol,
-                    'Shares': shares,
-                    'Avg Cost': f"${cost:,.2f}",
-                    'Current': f"${current:,.2f}",
-                    'Value': f"${value:,.2f}",
-                    'P&L': f"${pnl:+,.2f}",
-                    'P&L %': f"{pnl_pct:+.1f}%"
-                })
+        for symbol, position in portfolio_source.items():
+            shares = position['shares']
+            avg_cost = position['cost']
+            
+            # Get current price (fallback to cost if data fetch fails)
+            if symbol in market_data:
+                current_price = market_data[symbol]['price']
+                rsi = market_data[symbol]['rsi']
+            else:
+                current_price = avg_cost
+                rsi = 50.0
+            
+            market_value = shares * current_price
+            cost_basis = shares * avg_cost
+            pnl_open = market_value - cost_basis
+            pnl_pct = (pnl_open / cost_basis) * 100 if cost_basis != 0 else 0
+            
+            total_equity += market_value
+            total_cost_basis += cost_basis
+            
+            portfolio_rows.append({
+                'Symbol': symbol,
+                'Qty': shares,
+                'Trade Price': avg_cost,
+                'Mark': current_price,
+                'Mkt Value': market_value,
+                'P/L Open': pnl_open,
+                'P/L %': pnl_pct,
+                'RSI': rsi
+            })
+            
+        # Summary Metrics
+        total_pnl = total_equity - total_cost_basis
+        total_pnl_pct = (total_pnl / total_cost_basis) * 100 if total_cost_basis != 0 else 0
         
-        st.metric("Portfolio Value", f"${total_value:,.2f}")
-        st.dataframe(pd.DataFrame(portfolio_data), hide_index=True)
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Net Liq Value", f"${total_equity:,.2f}")
+        col2.metric("P/L Open", f"${total_pnl:,.2f}", f"{total_pnl_pct:+.2f}%")
+        col3.metric("Buying Power", "N/A")
+        col4.metric("Day P/L", "N/A")
+        
+        st.divider()
+        
+        # Display Table
+        if portfolio_rows:
+            df_view = pd.DataFrame(portfolio_rows)
+            
+            # Formatting
+            st.dataframe(
+                df_view,
+                column_config={
+                    "Symbol": "Symbol",
+                    "Qty": st.column_config.NumberColumn("Qty", format="%d"),
+                    "Trade Price": st.column_config.NumberColumn("Trade Price", format="$%.2f"),
+                    "Mark": st.column_config.NumberColumn("Mark", format="$%.2f"),
+                    "Mkt Value": st.column_config.NumberColumn("Mkt Value", format="$%.2f"),
+                    "P/L Open": st.column_config.NumberColumn("P/L Open", format="$%.2f"),
+                    "P/L %": st.column_config.NumberColumn("P/L %", format="%.2f%%"),
+                    "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+                },
+                hide_index=True,
+                use_container_width=True
+            )
 
 elif menu_selection == "Market Dashboard":
     st.title("📊 Market Dashboard")

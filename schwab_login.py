@@ -1,5 +1,6 @@
 from schwab.auth import easy_client
 import os
+import concurrent.futures
 
 try:
     import toml
@@ -19,7 +20,7 @@ def _load_schwab_secrets():
             return {
                 "api_key": s.get("app_key", ""),
                 "app_secret": s.get("app_secret", ""),
-                "callback_url": s.get("redirect_uri", "https://127.0.0.1"),
+                "callback_url": s.get("redirect_uri", "https://127.0.0.1:8182"),
             }
     except Exception:
         pass
@@ -39,7 +40,7 @@ def _load_schwab_secrets():
             return {
                 "api_key": s.get("app_key", ""),
                 "app_secret": s.get("app_secret", ""),
-                "callback_url": s.get("redirect_uri", "https://127.0.0.1"),
+                "callback_url": s.get("redirect_uri", "https://127.0.0.1:8182"),
             }
     raise FileNotFoundError(
         "No .streamlit/secrets.toml found. Add a [schwab] section with app_key, app_secret, redirect_uri."
@@ -53,18 +54,30 @@ def get_schwab_client():
     If not, it opens a browser for a manual login.
     Credentials are read from .streamlit/secrets.toml [schwab] or Streamlit secrets.
     """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         creds = _load_schwab_secrets()
-        client = easy_client(
+        future = executor.submit(easy_client,
             api_key=creds["api_key"],
             app_secret=creds["app_secret"],
             callback_url=creds["callback_url"],
             token_path=TOKEN_PATH,
+            interactive=False,
         )
-        return client
+        return future.result(timeout=300)
     except Exception as e:
+        # Handle OAuth errors (e.g. user cancelled the flow)
+        # The library parses the callback URL and raises an exception if 'error' is present
+        if "access_denied" in str(e):
+            print("Authentication cancelled: User denied access.")
+            return None
+        if isinstance(e, concurrent.futures.TimeoutError):
+            print("Authentication timed out. Login took too long or tab was closed.")
+            return None
         print(f"Error authenticating: {e}")
         return None
+    finally:
+        executor.shutdown(wait=False)
 
 if __name__ == "__main__":
     print("Attempting to connect to Schwab...")
