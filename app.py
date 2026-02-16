@@ -12,6 +12,70 @@ import certifi
 import os
 import math
 from schwab_login import get_schwab_client
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic import BaseModel
+from deps import FinancialDeps
+import tools 
+
+class DividendAnalysis(BaseModel):
+    ticker: str
+    is_sustainable: bool
+    explanation: str
+
+def _load_openai_api_key():
+    """Resolve OpenAI API key from env, Streamlit secrets, or local secrets.toml."""
+    if os.getenv("OPENAI_API_KEY"):
+        return os.getenv("OPENAI_API_KEY")
+
+    # Streamlit runtime secrets
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            openai_section = st.secrets.get("openai", {})
+            key = openai_section.get("api_key", "")
+            if not key:
+                key = st.secrets.get("OPENAI_API_KEY", "")
+            if key:
+                return key
+    except Exception:
+        pass
+
+    # Local .streamlit/secrets.toml fallback
+    possible_paths = [
+        ".streamlit/secrets.toml",
+        os.path.join(os.path.dirname(__file__), ".streamlit", "secrets.toml"),
+        os.path.join(os.getcwd(), ".streamlit", "secrets.toml"),
+    ]
+    for path in possible_paths:
+        if os.path.isfile(path):
+            try:
+                secrets = toml.load(path)
+                openai_section = secrets.get("openai", {})
+                key = openai_section.get("api_key", "")
+                if not key:
+                    key = secrets.get("OPENAI_API_KEY", "")
+                if key:
+                    return key
+            except Exception:
+                continue
+
+    return ""
+
+openai_api_key = _load_openai_api_key()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# 1. Initialize Agent with the dependency type
+openai_provider = OpenAIProvider(api_key=openai_api_key or None)
+agent = Agent(
+    OpenAIChatModel(OPENAI_MODEL, provider=openai_provider),
+    deps_type=FinancialDeps,
+    output_type=DividendAnalysis,
+)
+
+# 2. Register multiple tools from the other file
+agent.tool(tools.fetch_dividend_history)
+agent.tool(tools.fetch_payout_ratio)
 
 # ========== 1. INITIAL SETUP & CONFIG ==========
 st.set_page_config(
@@ -60,12 +124,28 @@ def load_configuration():
         SCREENER_CONFIG = config_data.get('screener', {})
         DATA_SOURCE = SCREENER_CONFIG.get('source', 'yfinance')
         FMP_API_KEY = secrets.get('fmp', {}).get('api_key', '')
+
+
+        my_context = FinancialDeps(
+            fmp_api_key = FMP_API_KEY,
+        )
+
+        # The Agent will automatically call 'fetch_dividend_history' AND 'fetch_payout_ratio'
+        # because the prompt requires both pieces of data.
+       # result = agent.run_sync(
+       #     "Check AAPL's dividend history and payout ratio. Is it sustainable for my risk level?",
+       #     deps = my_context
+       # )
+
+       # print(f"Analysis for {result.data.ticker}:")
+       # print(f"Sustainable: {result.data.is_sustainable}")
+       # print(f"Reasoning: {result.data.explanation}")
         
         return DATA_SOURCE, FMP_API_KEY
         
     except Exception as e:
         st.warning(f"Configuration loading issue: {e}. Using default settings.")
-        return 'yfinance', ''
+        return 
 
 # Load configuration ONCE at startup
 DATA_SOURCE, FMP_API_KEY = load_configuration()
@@ -269,6 +349,53 @@ def calculate_premium(current_price, strike_price, iv=0.3, dte=30, r=0.05):
         premium = current_price * iv * (time_years ** 0.5) * (1 + distance_pct)
     
     return round(max(premium, 0.05), 2)
+
+def assess_option_liquidity(option_row):
+    """Return liquidity label and score based on volume, OI, and bid-ask spread."""
+    try:
+        volume = option_row.get('volume', np.nan)
+        oi = option_row.get('openInterest', np.nan)
+        bid = option_row.get('bid', np.nan)
+        ask = option_row.get('ask', np.nan)
+        
+        volume = float(volume) if pd.notna(volume) else 0.0
+        oi = float(oi) if pd.notna(oi) else 0.0
+        bid = float(bid) if pd.notna(bid) else np.nan
+        ask = float(ask) if pd.notna(ask) else np.nan
+        
+        spread_pct = np.nan
+        if pd.notna(bid) and pd.notna(ask) and ask > 0 and bid >= 0:
+            mid = (bid + ask) / 2.0
+            if mid > 0:
+                spread_pct = (ask - bid) / mid
+        
+        score = 0
+        if volume >= 100:
+            score += 40
+        elif volume >= 20:
+            score += 20
+        
+        if oi >= 500:
+            score += 40
+        elif oi >= 100:
+            score += 20
+        
+        if pd.notna(spread_pct):
+            if spread_pct <= 0.10:
+                score += 20
+            elif spread_pct <= 0.20:
+                score += 10
+        
+        if score >= 80:
+            label = "High"
+        elif score >= 40:
+            label = "Med"
+        else:
+            label = "Low"
+        
+        return label, int(score)
+    except Exception:
+        return "Low", 0
 
 def get_company_name(symbol):
     """Get company name for symbol"""
@@ -553,9 +680,9 @@ with st.sidebar:
     st.title("💎 AlphaWheel v2.0")
     
     menu_options = {
-        "Portfolio Manager": "💰",
+        "Portfolio": "💰",
         "Stock Hunter (CSP)": "🔍",
-        "Watchlist Manager": "👀", 
+        "Watchlist": "👀", 
         "Market Dashboard": "📊"
     }
 
@@ -842,9 +969,13 @@ if menu_selection == "Stock Hunter (CSP)":
         - **Advanced Filters:** {sectors_text}
         """)
 
-elif menu_selection == "Watchlist Manager":
+elif menu_selection == "Watchlist":
     st.title("👀 Watchlist Manager")
     st.caption(f"Date: {datetime.now().strftime('%B %d, %Y')}")
+    watchlist_columns = [
+        "Symbol", "Price", "Strike", "Exp (Days)", "Vol", "Prob OTM", "Premium",
+        "Return", "Cash Req", "Liquidity", "Liq Score", "Contracts", "Total Cash", "Total Premium"
+    ]
     
     # Add Symbols + Free Cash
     col1, col2, col3 = st.columns([3, 2, 2])
@@ -911,6 +1042,8 @@ elif menu_selection == "Watchlist Manager":
                 strike_price = round(price * 0.95, 1) # fallback
                 premium = calculate_premium(price, strike_price, iv, dte)
                 option_volume = None
+                liquidity_label = "Low"
+                liquidity_score = 0
                 
                 option_snapshot = fetch_option_snapshot(symbol, target_dte=30)
                 if option_snapshot:
@@ -946,6 +1079,7 @@ elif menu_selection == "Watchlist Manager":
                             row = puts.loc[puts['prob_otm'].idxmax()]
                         
                         strike_price = float(row['strike'])
+                        liquidity_label, liquidity_score = assess_option_liquidity(row)
                         
                         iv_val = row.get('impliedVolatility')
                         if pd.notna(iv_val) and iv_val > 0:
@@ -978,7 +1112,9 @@ elif menu_selection == "Watchlist Manager":
                     'Prob OTM': prob_otm * 100,
                     'Premium': premium,
                     'Return': (premium / strike_price) * (365/dte) * 100,
-                    'Cash Req': strike_price * 100
+                    'Cash Req': strike_price * 100,
+                    'Liquidity': liquidity_label,
+                    'Liq Score': liquidity_score
                 })
         
         if watchlist_items:
@@ -1005,6 +1141,7 @@ elif menu_selection == "Watchlist Manager":
                     "Premium": "${:,.2f}",
                     "Return": "{:.1f}%",
                     "Cash Req": "${:,.0f}",
+                    "Liq Score": "{:,.0f}",
                     "Contracts": "{:,.0f}",
                     "Total Cash": "${:,.0f}",
                     "Total Premium": "${:,.2f}"
@@ -1026,10 +1163,12 @@ elif menu_selection == "Watchlist Manager":
                 st.rerun()
         else:
             st.info("No price data available")
+            st.dataframe(pd.DataFrame(columns=watchlist_columns), hide_index=True, width='stretch')
     else:
         st.info("Watchlist is empty. Add symbols above.")
+        st.dataframe(pd.DataFrame(columns=watchlist_columns), hide_index=True, width='stretch')
 
-elif menu_selection == "Portfolio Manager":
+elif menu_selection == "Portfolio":
     st.title("💰 Portfolio Manager")
     
     # Check mode
@@ -1146,3 +1285,5 @@ elif menu_selection == "Market Dashboard":
 st.divider()
 current_year = datetime.now().year
 st.caption(f"© {current_year} AlphaWheel Financial Technologies. All rights reserved. | Data Source: {DATA_SOURCE.upper()} | This tool is for educational purposes only.")
+
+

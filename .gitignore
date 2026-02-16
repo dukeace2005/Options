@@ -1,3 +1,6 @@
+# Masterprompt related files
+*masterprompt*
+
 .streamlit/
 
 # Virtual environments (installed third-party libs)
@@ -9,6 +12,7 @@ env/
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
 *.so
 *.egg
 *.egg-info/
